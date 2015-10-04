@@ -5,9 +5,16 @@ require (ggplot2)
 require (sqldf)
 require (dplyr)
 
+###########################################################################################################
+
+lm_formula <- as.formula(UsageVolume ~ factor(Season) + LoadProfileVolume +  AverageDailyHeatingDegreeDays)
+intercept  <- 'yes'
+factors    <- 'LP+HDD+SSN'
+
+############################################################################################################
 
 channel <- odbcDriverConnect(connection = "DRIVER={SQL Server}; SERVER=DBACM\\ARCHIMEDES; DATABASE=LoadForecastingAnalytics")
-data <- sqlQuery(channel, "SELECT * FROM ##JointData")
+#data <- sqlQuery(channel, "SELECT * FROM ##JointData")
 
 head(data)
 data$Month <- month(data$SettlementMonth) 
@@ -17,7 +24,7 @@ data_testing <- data
 data_split <- split(data_testing, data_testing$AccountNumberOID)
 head(data_split,1)
 
-account_fits <- lapply(data_split, lm, formula = UsageVolume ~ factor(Month):LoadProfileVolume-1)
+account_fits <- lapply(data_split, lm, formula = lm_formula  )
 
 
 ##Analysis of the model
@@ -50,22 +57,22 @@ model_stats <- extract_rsq(account_fits)
 #model_stats_weather_dependant <- subset(model_stats, pvalue < 0.05)
 
 
-mean(model_stats$r_sq)
-median( model_stats$r_sq)
-hist(model_stats$r_sq, main = 'Histogram of R Squared', breaks= 15)
+#mean(model_stats$r_sq)
+#median( model_stats$r_sq)
+#hist(model_stats$r_sq, main = 'Histogram of R Squared', breaks= 15)
 
 
-mean(model_stats$r_sq_real)
-median( model_stats$r_sq_real)
-hist(model_stats$r_sq_real, main = 'Histogram of R Squared', breaks= 15)
+#mean(model_stats$r_sq_real)
+#median( model_stats$r_sq_real)
+#hist(model_stats$r_sq_real, main = 'Histogram of R Squared', breaks= 15)
      
-mean(model_stats$r_adj_real)
-median( model_stats$r_adj_real)
-hist(model_stats$r_adj_real, main = 'Histogram of R Squared', breaks= 15)
+#mean(model_stats$r_adj_real)
+#median( model_stats$r_adj_real)
+#hist(model_stats$r_adj_real, main = 'Histogram of R Squared', breaks= 15)
 
-mean(model_stats$r_adj)
-median( model_stats$r_adj)
-hist(model_stats$r_adj, main = 'Histogram of R Squared', breaks= 15)
+#mean(model_stats$r_adj)
+#median( model_stats$r_adj)
+#hist(model_stats$r_adj, main = 'Histogram of R Squared', breaks= 15)
 
 
 #mean( model_stats$r_adj)
@@ -98,7 +105,14 @@ head(dataframe_all)
 
 
 dataframe_all$mape <- dataframe_all$mape*100
+
 dataframe_all$r_sq <- dataframe_all$r_sq*100
+dataframe_all$r_adj <- dataframe_all$r_adj*100
+
+dataframe_all$r_sq_real <- dataframe_all$r_sq_real*100
+dataframe_all$r_adj_real <- dataframe_all$r_adj_real*100
+
+
 
 
 hist(dataframe_all$mape, main = 'Histogram of Mape', breaks= 50)
@@ -107,12 +121,19 @@ median(dataframe_all$mape)
 #hist(dataframe_all$mape, main = 'Histogram of Mape', breaks= 15, xlim = c(0,20))
 
 head(dataframe_all)
+########################################################
 
-#dataframe_all$factors <- 'M_LP_CDD_HDD'
+if (intercept == 'no'){
+  dataframe_all$r_adj      <- dataframe_all$r_adj_real
+  dataframe_all$r_sq       <- dataframe_all$r_sq_real
+}
 
+dataframe_all$r_adj_real <- NULL
+dataframe_all$r_sq_real  <- NULL
 
+dataframe_all$factors <- factors
 
-#channel <- odbcDriverConnect(connection = "DRIVER={SQL Server}; SERVER=DBACM\\ARCHIMEDES; DATABASE=LoadForecastingAnalytics")
+channel <- odbcDriverConnect(connection = "DRIVER={SQL Server}; SERVER=DBACM\\ARCHIMEDES; DATABASE=LoadForecastingAnalytics")
 
-#sqlSave(channel,dataframe_all, tablename = 'RegressionOutput', rownames = FALSE,
-#        append=TRUE)
+sqlSave(channel,dataframe_all, tablename = 'RegressionOutput', rownames = FALSE,
+        append=TRUE)
