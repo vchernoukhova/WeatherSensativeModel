@@ -1,0 +1,391 @@
+Regression Model
+========================================================
+
+
+# Data Import
+
+As a first step we load several packages we need, and download data from the SQL database.
+
+```{r, message=FALSE}
+require (MASS)
+require (RODBC)
+require (lubridate)
+require (ggplot2)
+require (sqldf)
+require (dplyr)
+
+channel <- odbcDriverConnect(connection = "DRIVER={SQL Server}; SERVER=DBACM\\ARCHIMEDES; DATABASE=LoadForecastingAnalytics")
+data <- sqlQuery(channel, "SELECT * FROM ##OurData")
+
+## delete Caledar month from initial data, you don't need it
+#data$CalendarMonth <- NULL
+#data$TwoSeasons <- ifelse(data$Season %in% c('Spring','Summer'),'SummerSeason','WinterSeason')
+```
+
+
+# Normalizing the volumes
+
+Firstly we create the table Stat that for each account number will have its mean and standard deviation.
+
+```{r}
+Mean <- aggregate(DailyVolume~AccountNumberOID,data=data,FUN=mean)
+names(Mean)[2] <- 'MeanVolume'
+Std <- aggregate(DailyVolume~AccountNumberOID,data=data,FUN=sd)
+names(Std)[2] <- 'StandardDev'
+
+Stat <- cbind(Mean, Std$StandardDev)
+names(Stat)[3] <- 'StandardDev'
+head(Stat)
+```
+
+Then we join our data table to the table Stat on AccountNumberOID, and calculate normalized volumes for every account.
+```{r}
+data <- merge (data, Stat, by = 'AccountNumberOID')
+data$NormalizedDailyVolume <- (data$DailyVolume - data$MeanVolume)/ data$StandardDev
+head(data)
+
+```
+
+# Model Selection
+
+Firstly, we fit initial model for the stepwise regression.
+
+```{r }
+fit_all <- lm(NormalizedDailyVolume ~ 1, data = data)
+summary(fit_all)
+```
+
+Then we run bidirectional stepwise regression in order to choose only important parameters for our model.
+For now we are using only two weather parameters, we will test the others later.
+This model selection is run for all the accounts together, and then we are going to fit every account individually using the selected model.
+
+```{r }
+stepAIC (fit_all, direct = 'both', scope = list(upper = ~ AverageDailyHeatingDegreeDays +
+                                                  AverageDailyCoolingDegreeDays, low = ~1))
+```
+
+Fit the model for all accounts together. This is for demonstration purpose only. We are not going to use these coefficients, as we will build different models for each account.
+
+```{r}
+aic_fit_all <- lm(NormalizedDailyVolume ~ AverageDailyHeatingDegreeDays +
+                    AverageDailyCoolingDegreeDays, data = data)
+summary(aic_fit_all)
+```
+
+# Fitting selected model every account individually
+
+Since we have many (around 27,000) account numbers in our data, it can take a long time for R to process all of them. So for now we just want to try to build models for the first 7,000 accounts. 
+
+```{r }
+#set.seed(1) # so random result would be the same every time you run
+#data_testing <- subset (data, AccountNumberOID %in% sample(unique(data$AccountNumberOID),1000))
+data_testing <- subset (data, AccountNumberOID %in% unique(data$AccountNumberOID)[1:7000])
+```
+
+Now we split the data by account number, creating a list of account numbers, each with its own data frame.
+```{r }
+data_split <- split(data_testing, data_testing$AccountNumberOID)
+head(data_split,1)
+
+```
+
+Now we use lapply function in order to fit the models for all accounts.
+```{r }
+account_fits <- lapply(data_split, lm, formula = DailyVolume ~ AverageDailyCoolingDegreeDays + AverageDailyHeatingDegreeDays )
+head(account_fits,2)
+```
+
+
+
+# Analysis of models
+
+## Determining R Squared and p-value For each individual account model
+Now, after we fit all models for every account number, we want to analyze them and check how good they are.
+We create a data frame, that we call "model_stats", that for every account number will show p-value for F-test and R squared. 
+
+```{r}
+##Analysis of the model
+extract_rsq <- function(fits){
+  
+    model_stats <- data.frame()
+    for (i in 1:length(fits)){
+    
+    f <- summary(fits[[i]])$fstatistic
+    #calculate p-value
+    pvalue <- 1-pf(f[1],f[2],f[3])
+    r_sq <- summary(fits[[i]])$adj.r.squared
+    
+    model_stats<-rbind(model_stats,cbind(data_split[[i]]$AccountNumberOID[1],pvalue,r_sq))
+
+  } 
+  rownames(model_stats) <- NULL  
+  names(model_stats)[1] <- 'AccountNumberOID'
+  
+  return(model_stats)
+}
+
+model_stats <- extract_rsq(account_fits)
+```
+
+## Weather-sensetive Accounts
+We want to create regression model only for those account  numbers, for which weather has significant impact on the usage. So we filter only for the accounts that have p-value for F-statistics less than 5%. 
+
+```{r }
+#model_stats_weather_dependant <- subset(model_stats, pvalue < 0.05)
+
+#let's include all for now, just to test
+model_stats_weather_dependant <- model_stats
+```
+
+Total number of accounts is `r length(unique(model_stats$AccountNumberOID))`, number of weather-sensetive accounts is `r length(unique(model_stats_weather_dependant$AccountNumberOID))`, which gives us **`r format(round(100*length(unique(model_stats_weather_dependant$AccountNumberOID))/length(unique(model_stats$AccountNumberOID)), 2), nsmall = 2)`%  of weather sensetive accounts**, that we want to use regression model for.
+
+See below plots that demonstarte R squared distribution for weather dependant account:
+
+```{r }
+plot(model_stats_weather_dependant$r_sq, main = 'Plot of R Squared')
+hist(model_stats_weather_dependant$r_sq, main = 'Histogram of R Squared', breaks= 15)
+#mean(model_stats_weather_dependant$r_sq)
+#median(model_stats_weather_dependant$r_sq)
+```
+
+## MAPE calculation
+
+The result above shows us analysis of R sq, but we want to understand it in term of MAPEs. 
+For our model we would like to get an accuracy of 6%, so our main question at this point is what kind of R sq we need to have in order to get 6% of MAPE.
+
+To calculate MAPEs for every account, we need to find actual, and backcasted volumes.
+
+```{r }
+accounts_backcast <- lapply (account_fits, predict)
+# fit$dataframe is the data frame for the fit. first column is Y-variable
+
+#accounts_actual    <- subset (data_testing, select=c(AccountNumberOID,DailyVolume,CalendarMonth))
+accounts_actual   <- lapply (account_fits, function(x) x$model[,1])
+```
+
+Now converting lists into data frames for convinient use, and combining actual and backcasted volumes into one data frame.
+```{r }
+dataframe_backcast <- data.frame(
+  AccountNumberOID = rep(names(accounts_backcast), lapply(accounts_backcast, length)),
+  backcast = unlist(accounts_backcast))
+
+dataframe_actual <- data.frame(
+  AccountNumberOID = rep(names(accounts_actual), lapply(accounts_actual, length)),
+  actual = unlist(accounts_actual))
+
+dataframe_all <- data.frame(dataframe_backcast,actual=dataframe_actual$actual)
+head(dataframe_all)
+```
+
+Aggregating all the data together, and calculating absolute error, that we need for MAPE calculation.
+
+```{r }
+dataframe_all <- aggregate(cbind(actual,backcast,abs(actual-backcast))~AccountNumberOID,data=dataframe_all,FUN=sum)
+names(dataframe_all)[4]='error'
+```
+
+Calculating the mape:
+```{r }
+dataframe_all$mape <- with(dataframe_all,error/actual)
+```
+
+Now we want to merge all the data together, so we would have information about both R sq and MAPEs.
+
+```{r }
+dataframe_all <- merge(model_stats,dataframe_all)
+head(dataframe_all)
+```
+
+## MAPE vs R-squared
+
+Let's see how MAPE depends on R sq.
+
+Firstly we multiply percentage values by 100, so values on the graph would be more clear:
+```{r }
+dataframe_all$mape <- dataframe_all$mape*100
+dataframe_all$r_sq <- dataframe_all$r_sq*100
+
+```
+
+And then we plot MAPE against R squared:
+```{r }
+ggplot(data = dataframe_all, aes(x=r_sq, y=mape))+
+  geom_point(color = 'blue')+
+  theme_bw() +
+  xlab('R Squared, %') +
+  ylab('MAPE, %') +
+  ggtitle('MAPE vs R Squared') +
+  scale_x_continuous(breaks=c(-10:20)*5)+
+  scale_y_continuous(breaks=c(1:17)*5)
+
+```
+
+You can clearly see that for big R squared values MAPEs tend to be smaller, but we can't make good conclusions from this plot.
+So we tried couple of different approaches.
+
+### Avg MAPE vs R-sq threshold
+
+The first approach is the following:
+Instead of looking at the MAPEs for every particular value of R squared, we'll look at mean and median MAPEs for all R squared that are equal to or bigger than certain value.
+
+Firstly we need to do some data preparation.
+
+For values of R squared from 40% to 99.9% with a step of 0.5% we find mean and median of MAPE using "summary" function.
+```{r }
+threshold<-seq(40,99.9,0.5)
+
+mape_stats <- 
+  data.frame(
+    cbind(
+      threshold,
+      t(
+        sapply(
+          threshold,
+          function(th)
+            summary(subset(dataframe_all,r_sq>th)$mape)
+        )
+      )
+    )
+  )[,c('threshold','Median','Mean')]
+head(mape_stats)
+
+```
+
+Now we have to change format of the data frame in order to build ggplot:
+
+```{r }
+median      <- data.frame(rep('Median', nrow(mape_stats)))
+median_data <- cbind (mape_stats[,c('threshold','Median')],median)
+names(median_data) <- c('threshold','StatValue','StatName')
+
+
+mean      <- data.frame(rep('Mean', nrow(mape_stats)))
+mean_data <- cbind (mape_stats[,c('threshold','Mean')],mean)
+names(mean_data) <- c('threshold','StatValue','StatName')
+
+mape_stats_processed <- rbind(median_data,mean_data)
+mape_stats_processed$StatValue <- mape_stats_processed$StatValue
+mape_stats_processed$threshold <- mape_stats_processed$threshold
+
+head(mape_stats_processed)
+
+```
+
+Now we are ready to build our plot:
+
+```{r, warning=FALSE, echo = FALSE  }
+ggplot(data = mape_stats_processed, aes(x=threshold, y=StatValue))+
+  geom_point(aes(colour=StatName)) +
+  theme_bw() +
+  xlab('Threshold for R squared, %') +
+  ylab('Mean or Median MAPE, %') +
+  ggtitle('Mean and Median of MAPEs for R sq more than a fixed value') +
+  scale_x_continuous(breaks=c(8:20)*5)+
+  scale_y_continuous(breaks=c(1:20)*0.5)
+
+```
+
+
+### Proportion of accounts with MAPE within a certain limit vs R-sq threshold
+
+Let's now make another plot.
+
+Our goal is to have MAPE of 6% or less, so let's build a plot, that shows probabilies for MAPE to be less than or equal to 6%.
+We'll plot other MAPE values for comparison as well.
+
+Firstly, we prepare the data for plotting.
+
+```{r, warning=FALSE}
+
+# a function for calculating a proportion of accounts with MAPE within a specified limit (for different R-sq thresholds)
+prob_data_for_mape <- function(x)
+{
+  prob_data_for_mape <-    
+    data.frame(
+      cbind(
+        x,
+        threshold,
+        sapply(
+          threshold, 
+          function(th) 
+            length(subset(dataframe_all,r_sq>th & mape<=x)$mape)/length(subset(dataframe_all,r_sq>th)$mape)
+        )
+      )
+    )
+  
+  names(prob_data_for_mape) <- c ('MAPE','threshold', 'prob')
+  return(prob_data_for_mape)
+}
+
+
+# constructing proportions for different MAPE limits
+prob_data_all_mapes <- rbind (prob_data_for_mape(4),
+                              prob_data_for_mape(5),
+                              prob_data_for_mape(6),
+                              prob_data_for_mape(7),
+                              prob_data_for_mape(8),
+                              prob_data_for_mape(9),
+                              prob_data_for_mape(10))
+
+
+#prob_data_all_mapes$MAPE      <- prob_data_all_mapes$MAPE
+prob_data_all_mapes$MAPE      <- factor(prob_data_all_mapes$MAPE, levels = c(10,9,8,7,6,5,4))
+#prob_data_all_mapes$MAPE      <- factor(paste('\u2264', prob_data_all_mapes$MAPE, '%', sep =''))
+prob_data_all_mapes$prob      <- prob_data_all_mapes$prob*100
+prob_data_all_mapes$threshold <- prob_data_all_mapes$threshold
+
+```
+
+Now we are ready to build the plot:
+
+```{r, echo = FALSE, warning=FALSE }
+
+x_comment <- function(x){
+  out<- min(prob_data_all_mapes[prob_data_all_mapes$MAPE==x,]$threshold)+3
+  return(out)
+}
+
+y_comment <- function(x){
+  out <- min(prob_data_all_mapes[prob_data_all_mapes$MAPE==x & !is.na(prob_data_all_mapes$prob) & prob_data_all_mapes$prob>0,]$prob)+2
+  if (x ==10 | x==9) { out <- out+2}
+  if (x ==8  | x==7) { out <- out+1}
+  return(out)
+}
+
+ggplot(data = prob_data_all_mapes, aes(x=threshold, y=prob))+
+  geom_point(aes(colour=MAPE)) +
+  theme_bw() +
+  xlab('Threshold for R squared, %') +
+  ylab('Probability of MAPE to be less than or equal to the wanted MAPE, %') +
+  scale_x_continuous(breaks=c(8:20)*5)+
+  scale_y_continuous(breaks=c(0:20)*5) +
+  annotate("text", x = x_comment(4),
+                   y = y_comment(4),    
+                   size = 3.35, 
+                   label = paste('MAPE ','\u2264', '4%',  sep ='')) +
+  annotate("text", x = x_comment(5),
+                   y = y_comment(5),  
+                   size = 3.35, 
+                   label = paste('MAPE ','\u2264', '5%',  sep =''))+
+  annotate("text", x = x_comment(6),
+                   y = y_comment(6),
+                   size = 3.35, 
+                   label = paste('MAPE ','\u2264', '6%',  sep =''))+
+  annotate("text", x = x_comment(7),
+                   y = y_comment(7),  
+                   size = 3.35, 
+                   label = paste('MAPE ','\u2264', '7%',  sep =''))+ 
+  annotate("text", x = x_comment(8),
+                   y = y_comment(8),
+                   size = 3.35, 
+                   label = paste('MAPE ','\u2264', '8%',  sep =''))+  
+  annotate("text", x = x_comment(9),
+                   y = y_comment(9),  
+                   size = 3.35,
+                   label = paste('MAPE ','\u2264', '9%',  sep =''))+  
+  annotate("text", x = x_comment(10),
+                   y = y_comment(10),  
+                   size = 3.35,
+                   label = paste('MAPE ','\u2264', '10%', sep =''))
+
+```
